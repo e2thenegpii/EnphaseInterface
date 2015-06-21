@@ -13,7 +13,6 @@ from lxml import etree as et
 from enum import Enum
 
 APIV2 = 'https://api.enphaseenergy.com/api/v2'
-APPAUTH = 'https://enlighten.enphaseenergy.com/app_user_auth/new'
 APIKEY = ''
 
 DEFAULT_MAX_WAIT = 60
@@ -134,8 +133,8 @@ class DateTimeType(Enum):
             if query['start_date'] > query['end_date']:
                 logging.error('The value for start_date is after end_date')
                 raise ValueError('start_date is after end_date')
-            
-        for k,v in query:
+
+        for k,v in query.items():
             if '_at' in k or '_date' in k:
                 if v > dt.datetime.now():
                     logging.error('The value for %s is set to the future' % k)
@@ -147,7 +146,7 @@ class EnphaseOutputWrapperRaw(object):
     def convert(self, data):
         return data
         
-class EnphaseOuptutWrapperJson(EnphaseOuptutWrapperRaw):
+class EnphaseOuptutWrapperJson(EnphaseOutputWrapperRaw):
     '''Package up the output data in a json format'''
     def convert(self, data):
         return json.loads(data.decode(encoding='UTF-8'))
@@ -175,7 +174,6 @@ class EnphaseInterface(object):
                             
         self.opener = r.build_opener(self.handler)
         self.apiDest = APIV2
-        self.appauth = APPAUTH
         self.outputWrapper = wrapper
 
     def _execQuery(self, system_id, command, extraParams = dict()):
@@ -211,45 +209,53 @@ class EnphaseInterface(object):
     def setOutputWrapper(self, outputWrapper):
         self.outputWrapper = outputWrapper
             
-    def authorizeApplication(self, app_id, username, password):
-        '''Authorize an application to access a systems data
-            and get the user id'''
+    @staticmethod
+    def _processPage(request):
+        logging.debug(request.geturl())
 
-        cookiefile = 'e.cookies'
-        jar = cj.FileCookieJar(cookiefile)
-        jar.save()
+        root = et.HTML(request.read().decode(encoding='UTF-8'))
+        form = root.find('.//form[@action]')
 
-        opener = r.build_opener(r.HTTPCookieProcessor(jar))
-        opener.addheaders = [('User-agent':'Mozilla/5.0')]
-        
-        q = p.urlencode({'app_id':app_id})
-        query = self.appauth + '?' + q
-
-        response = opener.open(query)
-        jar.save()
-
-        root = et.fromstring(response.readall())
-
-        login_data = {'user[email]':username,'user[password]':password}
-        
-        #hiddenInput = root.find(".//input[@name='authenticity_token'"])        
+        payload = {}
         for node in root.findall('.//input[@type="hidden"]'):
-            login_data[node.attrib['name']] = node.attrib['value']
+            payload[node.attrib['name']] = node.attrib['value']
 
-        data = p.urlencode(login_data)
+        return (form.attrib['action'],payload)
 
-        response = opener.open(response.geturl(), data)
-        jar.save()
-        
-        login_data.pop('user[email]')
-        login_data.pop('user[password]')
-        login_data['app_user_auth[tscale_app_id]'] = app_id
-        
-        data = p.urlencode(login_data)
-        response = opener.open(response.geturl(),data)
-        jar.save()
+    @staticmethod
+    def authorizeApplication(app_id, username, password):
+        '''Authorize an application to access a systems data
+            and get the user_id'''
 
-        return response.info()['enlighten-api-user-id']
+        scheme = 'https'
+        base_url = 'enlighten.enphaseenergy.com'
+        action = 'app_user_auth/new'
+        query = p.urlencode({'app_id':app_id})
+
+        request1 = p.urlunsplit((scheme,base_url,action,query,''))
+        logging.debug(request1)
+
+        opener = r.build_opener(r.HTTPCookieProcessor())
+        opener.addheaders = [('User-agent','Mozilla/5.0')]
+        r1 = opener.open(request1)
+
+        action,hiddens = EnphaseInterface._processPage(r1)
+
+        payload = {'user[email]':username,'user[password]':password}
+        hiddens.update(payload)
+
+        request2 = p.urlunsplit((scheme,base_url,action,query,''))
+        r2 = opener.open(request2,p.urlencode(hiddens).encode(encoding='UTF-8'))
+        action, hiddens = EnphaseInterface._processPage(r2)
+
+        request3 = p.urlunsplit((scheme,base_url,action,query,''))
+        r3 = opener.open(request3,p.urlencode(hiddens).encode(encoding='UTF-8'))
+
+        if 'enlighten-api-user-id' not in r3.info():
+            logging.critical('Failed to aquire user_id')
+
+        logging.debug(r3.info()['enlighten-api-user-id'])
+        return r3.info()['enlighten-api-user-id']
 
     def energy_lifetime(self, system_id, **kwargs):
         '''Get the lifetime energy produced by the system'''
