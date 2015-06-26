@@ -10,6 +10,16 @@ from lxml import etree as et
 
 import EnphaseInterface as ei
 
+def parseEnergy(data):
+    for k,v in data.items():
+        if v[-3:] == 'MWh' or v[-2:] == 'MW':
+            data[k] = int(float(v.split()[0])*(10**6))
+        elif v[-3:] == 'kWh' or v[-2:] == 'kW':
+            data[k] = int(float(v.split()[0])*(10**3))
+        elif v[-2:] == 'Wh' or v[-1:] == 'W':
+            data[k] = int(float(v.split()[0])*(10**0))
+    return data
+
 class EnvoyInterface(object):
     def __init__(self, envoyUrl,
         wrapper=ei.EnphaseOutputWrapperRaw()):
@@ -19,33 +29,32 @@ class EnvoyInterface(object):
         self.opener = r.build_opener()
         self.wrapper = wrapper
         
-    def _getPage(self, action,kwargs):
+    def _getPage(self,action,**kwargs):
     
         query = p.urlencode(kwargs)
         
         request = p.urlunsplit(('http',self.envoyUrl,action,query,''))
         
         logging.debug(request)
-        response = self.opener(request)
+        response = self.opener.open(request)
         
         logging.debug(response.geturl())
         
-        return et.HTML(request.read().decode(encoding='UTF-8'))
+        return et.HTML(response.read().decode(encoding='UTF-8'))
         
     def _parseProduction(self):
         
         root = self._getPage('production', locale='en')
-        table = root.find('.//h1/div/table')
+        table = root.find('.//div[@style]/table')
         data = {}
-        for row in table.find('./tr'):
+        for row in table.findall('./tr'):
             if len(row) > 1:
                 key,value = row
-                data[key.text] = value.text
+                data[key.text] = value.text.strip()
             else:
-                data['start_date'] = row.find('./div[@class="good"]').text
+                data['start_date'] = row.find('.//div[@class="good"]').text.strip()
         
-        #todo convert values in data from strings to meaningful values
-        return data
+        return parseEnergy(data)
         
     def _parseHome(self):
 
@@ -54,26 +63,29 @@ class EnvoyInterface(object):
         
         serial = root.xpath('.//td[contains(text(),"Envoy Serial Number")]')
         
-        key,value = serial.text.split(':',1)
-        data[key] = value
+        key,value = serial[0].text.split(':',1)
+        data[key] = value.strip()
         
-        table = root.find('.//h1/table[@style]')
+        table = root.findall('.//table[@style]')[1]
 
-        for div in table.find('./tr/td/h2/div[@class]'):
-            if div.text == 'Connection to Web' and 
-                div.attrib['class'] == 'good':
-                data['status'] = 'normal'
+        for div in table.findall('.//div[@class]'):
+            if div.text is not None:
+                if div.text.strip() == 'Connection to Web':
+                    if div.attrib['class'] == 'good':
+                        data['status'] = 'normal'
 
         if 'status' not in data:
             data['status'] = 'comm'
             
-        table2 = table.find('./table')
+        table2 = table.find('.//table')
         
-        for k,v in table2.find('./tr'):
-            data[k.text] = v.text
-            
-        #todo convert values in data from strings to meaningful values
-        return data         
+        for k,v in table2.findall('.//tr'):
+            if v.text is None:
+                data[k.text] = v[0].text.strip()
+            else:
+                data[k.text] = v.text.strip()
+
+        return parseEnergy(data)
         
     def _parseInventory(self):
         root = self._getPage('inventory',locale='en')
@@ -90,7 +102,7 @@ class EnvoyInterface(object):
         j = {}
         
         j['start_date'] = data['start_date']
-        j['system_id'] = system_id
+        j['system_id'] = int(system_id)
         j['production'] = [data['Since Installation']]
         
         return json.dumps(j)
@@ -103,11 +115,12 @@ class EnvoyInterface(object):
         j = {}
 
         data = self._parseHome()
-        j['system_id'] = system_id
+        j['system_id'] = int(system_id)
         envoy = {}
         
+        delta = dt.timedelta(minutes=int(data['Last connection to website'].split()[0]))
         envoy['envoy_id'] = 0
-        envoy['last_report_at'] = data['Last Connection to website'] + dt.datetime.now()
+        envoy['last_report_at'] = int((delta + dt.datetime.now()).timestamp())
         envoy['name'] = 'Envoy %s' % data['Envoy Serial Number']
         envoy['part_number'] = ''
         envoy['serial_number'] = data['Envoy Serial Number']
@@ -128,7 +141,7 @@ class EnvoyInterface(object):
         
         j = {}
         action = 'datatab/inventory_dt.rb'
-        query = p.urlencode({'locale':'en','name':'PCU'}])
+        query = p.urlencode({'locale':'en','name':'PCU'})
         
         request = p.urlunsplit(('http',self.envoyUrl,action,query,''))
         
@@ -136,10 +149,10 @@ class EnvoyInterface(object):
         
         data = json.loads(response.read().decode(encoding='UTF-8'))
         
-        j['system_id'] = system_id
+        j['system_id'] = int(system_id)
         inverters = []
         for d in data['aaData']:
-            inverters.append({'sn':d[2],'model':'unknown']})
+            inverters.append({'sn':d[2],'model':'unknown'})
         j['inverters'] = inverters
 
         return json.dumps(j)
@@ -155,9 +168,23 @@ class EnvoyInterface(object):
         raise NotImplementedError()
 
     def stats(self, system_id, **kwargs):
-        '''Get the 5 minute interval data for the given day'''
+        '''Get the 5 minute interval data for the given day
+            This function ignores the start at or end at parameters'''
 
-        return self._execQuery(system_id, 'stats', kwargs)
+        j = {}
+        data = self._parseHome()
+        powr = data['Currently generating']
+        enwh = int(float(powr)/12)
+        ts = dt.datetime.now()
+        ts = ts.replace(microsecond=0,second=0,minute=int((ts.minute/5)*5))
+        ts = int(ts.timestamp())
+        micros = int(data['Number of Microinverters'])
+        reading = {'end_at':ts,'powr':powr,'enwh':enwh,'devices_reporting':micros}
+        j['system_id'] = int(system_id)
+        j['total_devices'] = int(data['Number of Microinverters'])
+        j['intervals'] = [reading]
+
+        return json.dumps(j)
 
     def summary(self, system_id, **kwargs):
         '''Get the system summary'''
