@@ -7,9 +7,9 @@ import json
 import time
 import logging
 
-import http.cookiejar as cj
 from lxml import etree as et
-
+from pandas import Series,to_timedelta,to_datetime,concat,DataFrame
+from pandas.io.json import json_normalize
 from enum import Enum
 
 APIV2 = 'https://api.enphaseenergy.com/api/v2'
@@ -102,9 +102,9 @@ class DateTimeType(Enum):
                 return d.strftime('%Y-%m-%d')
             else:
                 return str(int(d.timestamp()))
-        elif self is Iso8601:
+        elif self is DateTimeType.Iso8601:
             return d.isoformat()
-        elif self is Epoch:
+        elif self is DateTimeType.Epoch:
             return str(int(d.timestamp()))
         logging.warning('Failed to stringify %s' % value)
             
@@ -113,12 +113,12 @@ class DateTimeType(Enum):
         
         if self is DateTimeType.Enphase:
             if '_date' in key:
-                return dt.datetime.strftime('%Y-%m-%d')
+                return dt.datetime.strptime(value,'%Y-%m-%d')
             else:
                 return dt.datetime.fromtimestamp(value)
-        elif self is Iso8601:
+        elif self is DateTimeType.Iso8601:
             return dp.parser.parse(value) 
-        elif self is Epoch:
+        elif self is DateTimeType.Epoch:
             return dt.datetime.fromtimestamp(value)
         logging.warning('Failed to datetimeify %s' % value)
         
@@ -143,19 +143,99 @@ class DateTimeType(Enum):
 
 class EnphaseOutputWrapperRaw(object):
     '''Package up the output data in a raw format'''
-    def convert(self, data):
+    def convert(self, datatype, data, dtt):
         return data
         
-class EnphaseOuptutWrapperJson(EnphaseOutputWrapperRaw):
+class EnphaseOutputWrapperJson(EnphaseOutputWrapperRaw):
     '''Package up the output data in a json format'''
-    def convert(self, data):
+    def convert(self, datatype, data, dtt):
         return json.loads(data.decode(encoding='UTF-8'))
         
 class EnphaseOutputWrapperPandas(EnphaseOutputWrapperRaw):
     '''Package up the output data in a pandas dataframe'''
-    def convert(self, data):
-        raise NotImplementedError()
-        return data
+
+    def _energy_lifetime(self,data,dtt):
+        d = json_normalize(data, 'production',['start_date','system_id'])
+        ts = to_timedelta(Series(d.index),unit='D')
+        d['start_date'] = to_datetime(d['start_date'],unit='s') + ts
+        d['start_date'] = d['start_date'].apply(
+                lambda x:dtt.stringify('start_date',x))
+        d.rename(columns={0:'production'},inplace=True)
+
+        return d.set_index(['system_id','start_date'])
+
+    def _envoys(self,data):
+        return json_normalize(data, 'envoys',
+            ['system_id']).set_index(['system_id','serial_number'])
+
+    def _index(self,data):
+        return json_normalize(data,'systems').set_index('system_id')
+
+    def _inventory(self,data):
+        cl = []
+        for key in ['inverters','envoys','meters']:
+            if key in data:
+                cl.append(json_normalize(data,key,['system_id']))
+            #this assumes only the envoys don't return the model type
+        tmp = concat(cl).fillna('Envoy').set_index(['system_id','sn'])
+        #normalize the index
+        tmp.index.name = ['system_id','serial_number']
+        return tmp
+
+    def _monthly_production(self,data):
+        if len(data['meter_readings']) > 0:
+            output = json_normalize(data,'meter_readings',
+                ['start_date','system_id','end_date','production_wh'])
+        else:
+            output = json_normalize(data,meta=
+                    ['start_date','system_id','end_date','production_wh'])
+        return output.set_index(['system_id','start_date','end_date'])
+
+    def _stats(self,data):
+        if len(data['intervals']) > 0:
+            output = json_normalize(data,'intervals',
+                ['system_id','total_devices']).set_index(['system_id',
+                    'end_at'])
+        else:
+            output = json_normalize(data).set_index('system_id')
+        return output
+
+    def _summary(self,data):
+        return json_normalize(data).set_index('system_id')
+
+    def _datetimeify(self,output,dtt):
+        indexes = output.index.names
+        output.reset_index(inplace=True)
+        for col in output.columns:
+            if '_at' in col or '_date' in col:
+                output[col] = output[col].apply(lambda x:dtt.datetimeify(col,x))
+        return output.set_index(indexes)
+
+    def convert(self, datatype, data, dtt):
+
+        data = json.loads(data.decode(encoding='UTF-8'))
+        logging.debug(data)
+
+        if datatype == 'energy_lifetime':
+            output = self._energy_lifetime(data,dtt)
+        elif datatype == 'envoys':
+            output = self._envoys(data)
+        elif datatype == 'index' or datatype == '':
+            output = self._index(data)
+        elif datatype == 'inventory':
+            output = self._inventory(data)
+        elif datatype == 'monthly_production':
+            output = self._monthly_production(data)
+        elif datatype == 'rgm_stats':
+            output = self._stats(data)
+        elif datatype == 'stats':
+            output = self._stats(data)
+        elif datatype == 'summary':
+            output = self._summary(data)
+        else:
+            raise ValueError('datatype parameter not supported')
+
+        return self._datetimeify(output,dtt)
 
 class EnphaseInterface(object):
     '''Interfaces with the Enphase api and returns the raw json
@@ -168,7 +248,7 @@ class EnphaseInterface(object):
 
         self.parameters = { 'user_id': userId,
                             'key': APIKEY }
-        
+
         self.dtt = DateTimeType.Enphase
         self.handler = EnphaseErrorHandler(self.dtt, max_wait)
                             
@@ -195,7 +275,8 @@ class EnphaseInterface(object):
         req = r.Request(query, headers={'Content-Type':'application/json'})
         
         logging.debug('GET %s' % query)
-        return self.outputWrapper.convert(self.opener.open(req).read())
+        return self.outputWrapper.convert(command[1:],self.opener.open(req).read(),
+                self.dtt)
         
     def setDateTimeType(self, dtt):
         '''Set the timestamp type for the Enphase API'''
@@ -285,9 +366,11 @@ class EnphaseInterface(object):
 
         return self._execQuery(system_id, 'inventory', kwargs)
 
-    def monthly_production(self, system_id, start_date, **kwargs):
+    def monthly_production(self, system_id, **kwargs):
         '''List the energy produced in the last month'''
 
+        if 'start_date' not in kwargs:
+            raise AttributeError('start_date required parameter')
         return self._execQuery(system_id, 'monthly_production', kwargs)
 
     def rgm_stats(self, system_id, **kwargs):
