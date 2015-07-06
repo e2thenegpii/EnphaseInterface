@@ -9,8 +9,10 @@ import logging
 
 from lxml import etree as et
 from pandas import Series,to_timedelta,to_datetime,concat,DataFrame
+import pandas as pd
 from pandas.io.json import json_normalize
 from enum import Enum
+import sqlalchemy as sa
 
 APIV2 = 'https://api.enphaseenergy.com/api/v2'
 APIKEY = ''
@@ -141,108 +143,11 @@ class DateTimeType(Enum):
                     raise ValueError('A query with a future time is malformed')
                 query[k] = self.stringify(k,v)
 
-class EnphaseOutputWrapperRaw(object):
-    '''Package up the output data in a raw format'''
-    def convert(self, datatype, data, dtt):
-        return data
-        
-class EnphaseOutputWrapperJson(EnphaseOutputWrapperRaw):
-    '''Package up the output data in a json format'''
-    def convert(self, datatype, data, dtt):
-        return json.loads(data.decode(encoding='UTF-8'))
-        
-class EnphaseOutputWrapperPandas(EnphaseOutputWrapperRaw):
-    '''Package up the output data in a pandas dataframe'''
-
-    def _energy_lifetime(self,data,dtt):
-        d = json_normalize(data, 'production',['start_date','system_id'])
-        ts = to_timedelta(Series(d.index),unit='D')
-        d['start_date'] = to_datetime(d['start_date'],unit='s') + ts
-        d['start_date'] = d['start_date'].apply(
-                lambda x:dtt.stringify('start_date',x))
-        d.rename(columns={0:'production'},inplace=True)
-
-        return d.set_index(['system_id','start_date'])
-
-    def _envoys(self,data):
-        return json_normalize(data, 'envoys',
-            ['system_id']).set_index(['system_id','serial_number'])
-
-    def _index(self,data):
-        return json_normalize(data,'systems').set_index('system_id')
-
-    def _inventory(self,data):
-        cl = []
-        for key in ['inverters','envoys','meters']:
-            if key in data:
-                cl.append(json_normalize(data,key,['system_id']))
-            #this assumes only the envoys don't return the model type
-        tmp = concat(cl).fillna('Envoy').set_index(['system_id','sn'])
-        #normalize the index
-        tmp.index.name = ['system_id','serial_number']
-        return tmp
-
-    def _monthly_production(self,data):
-        if len(data['meter_readings']) > 0:
-            output = json_normalize(data,'meter_readings',
-                ['start_date','system_id','end_date','production_wh'])
-        else:
-            output = json_normalize(data,meta=
-                    ['start_date','system_id','end_date','production_wh'])
-        return output.set_index(['system_id','start_date','end_date'])
-
-    def _stats(self,data):
-        if len(data['intervals']) > 0:
-            output = json_normalize(data,'intervals',
-                ['system_id','total_devices']).set_index(['system_id',
-                    'end_at'])
-        else:
-            output = json_normalize(data).set_index('system_id')
-        return output
-
-    def _summary(self,data):
-        return json_normalize(data).set_index('system_id')
-
-    def _datetimeify(self,output,dtt):
-        indexes = output.index.names
-        output.reset_index(inplace=True)
-        for col in output.columns:
-            if '_at' in col or '_date' in col:
-                output[col] = output[col].apply(lambda x:dtt.datetimeify(col,x))
-        return output.set_index(indexes)
-
-    def convert(self, datatype, data, dtt):
-
-        data = json.loads(data.decode(encoding='UTF-8'))
-        logging.debug(data)
-
-        if datatype == 'energy_lifetime':
-            output = self._energy_lifetime(data,dtt)
-        elif datatype == 'envoys':
-            output = self._envoys(data)
-        elif datatype == 'index' or datatype == '':
-            output = self._index(data)
-        elif datatype == 'inventory':
-            output = self._inventory(data)
-        elif datatype == 'monthly_production':
-            output = self._monthly_production(data)
-        elif datatype == 'rgm_stats':
-            output = self._stats(data)
-        elif datatype == 'stats':
-            output = self._stats(data)
-        elif datatype == 'summary':
-            output = self._summary(data)
-        else:
-            raise ValueError('datatype parameter not supported')
-
-        return self._datetimeify(output,dtt)
-
-class EnphaseInterface(object):
+class RawEnphaseInterface(object):
     '''Interfaces with the Enphase api and returns the raw json
         It expects all dates and times to be in a child of a datetime type'''
 
-    def __init__(self, userId, max_wait=DEFAULT_MAX_WAIT, 
-        wrapper = EnphaseOutputWrapperRaw()):
+    def __init__(self, userId, max_wait=DEFAULT_MAX_WAIT):
         if APIKEY == '':
             raise ValueError("APIKEY not set")
 
@@ -254,13 +159,12 @@ class EnphaseInterface(object):
                             
         self.opener = r.build_opener(self.handler)
         self.apiDest = APIV2
-        self.outputWrapper = wrapper
 
     def _execQuery(self, system_id, command, extraParams = dict()):
         '''Generates a request url for the Enphase API'''
 
         if system_id is not '':
-            system_id = '/' + system_id
+            system_id = '/' + str(system_id)
         if command is not '':
             command = '/' + command
 
@@ -275,8 +179,9 @@ class EnphaseInterface(object):
         req = r.Request(query, headers={'Content-Type':'application/json'})
         
         logging.debug('GET %s' % query)
-        return self.outputWrapper.convert(command[1:],self.opener.open(req).read(),
-                self.dtt)
+        response = self.opener.open(req).read()
+        logging.debug(response.decode('UTF-8'))
+        return response
         
     def setDateTimeType(self, dtt):
         '''Set the timestamp type for the Enphase API'''
@@ -286,9 +191,6 @@ class EnphaseInterface(object):
         
         if dtt is DateTimeType.Enphase:
             self.parameters.pop('datetime_format',None)
-            
-    def setOutputWrapper(self, outputWrapper):
-        self.outputWrapper = outputWrapper
             
     @staticmethod
     def _processPage(request):
@@ -387,3 +289,170 @@ class EnphaseInterface(object):
         '''Get the system summary'''
 
         return self._execQuery(system_id, 'summary', kwargs)
+
+class JsonEnphaseInterface(RawEnphaseInterface):
+    def _execQuery(self, system_id, command, extraParams = dict()):
+        data = super(JsonEnphaseInterface,self)._execQuery(system_id,
+            command, extraParams)
+        return json.loads(data.decode('UTF-8'))
+
+class PandasEnphaseInterface(JsonEnphaseInterface):
+    def _execQuery(self, system_id, command, extraParams = dict()):
+
+        data = super(PandasEnphaseInterface,self)._execQuery(system_id,
+            command, extraParams)
+        logging.debug(data)
+
+        if command == 'energy_lifetime':
+            output = self._energy_lifetime(data,dtt)
+        elif command == 'envoys':
+            output = self._envoys(data)
+        elif command == 'index' or command == '':
+            output = self._index(data)
+        elif command == 'inventory':
+            output = self._inventory(data)
+        elif command == 'monthly_production':
+            output = self._monthly_production(data)
+        elif command == 'rgm_stats':
+            output = self._stats(data)
+        elif command == 'stats':
+            output = self._stats(data)
+        elif command == 'summary':
+            output = self._summary(data)
+        else:
+            raise ValueError('datatype parameter not supported')
+
+        return self._datetimeify(output)
+
+    def _energy_lifetime(self,data):
+        d = json_normalize(data, 'production',['start_date','system_id'])
+        ts = to_timedelta(Series(d.index),unit='D')
+        d['start_date'] = to_datetime(d['start_date'],unit='s') + ts
+        d['start_date'] = d['start_date'].apply(
+                lambda x:self.dtt.stringify('start_date',x))
+        d.rename(columns={0:'production'},inplace=True)
+
+        return d.set_index(['system_id','start_date'])
+
+    def _envoys(self,data):
+        return json_normalize(data, 'envoys',
+            ['system_id']).set_index(['system_id','serial_number'])
+
+    def _index(self,data):
+        return json_normalize(data,'systems').set_index('system_id')
+
+    def _inventory(self,data):
+        cl = []
+        for key in ['inverters','envoys','meters']:
+            if key in data:
+                cl.append(json_normalize(data,key,['system_id']))
+            #this assumes only the envoys don't return the model type
+        tmp = concat(cl).fillna('Envoy').set_index(['system_id','sn'])
+        #normalize the index
+        tmp.index.name = ['system_id','serial_number']
+        return tmp
+
+    def _monthly_production(self,data):
+        if len(data['meter_readings']) > 0:
+            output = json_normalize(data,'meter_readings',
+                ['start_date','system_id','end_date','production_wh'])
+        else:
+            output = json_normalize(data,meta=
+                    ['start_date','system_id','end_date','production_wh'])
+        return output.set_index(['system_id','start_date','end_date'])
+
+    def _stats(self,data):
+        if len(data['intervals']) > 0:
+            output = json_normalize(data,'intervals',
+                ['system_id','total_devices']).set_index(['system_id',
+                    'end_at'])
+        else:
+            output = json_normalize(data).set_index('system_id')
+        return output
+
+    def _summary(self,data):
+        return json_normalize(data).set_index(['system_id','summary_date'])
+
+    def _datetimeify(self,output):
+        indexes = output.index.names
+        output.reset_index(inplace=True)
+        for col in output.columns:
+            if '_at' in col or '_date' in col:
+                output[col] = output[col].apply(
+                    lambda x:self.dtt.datetimeify(col,x))
+        return output.set_index(indexes)
+
+class CachingEnphaseInterface(PandasEnphaseInterface):
+    def __init__(self, userId, max_wait=DEFAULT_MAX_WAIT, 
+        engine = sa.create_engine('sqlite://')):
+            super(CachingEnphaseInterface,self).__init__(
+                    userId, max_wait)
+            self.engine = engine
+
+    def _addSummary(self, system_id, kwargs):
+        summary = super(CachingEnphaseInterface,self)._execQuery(
+            system_id,'summary',kwargs)
+        s = summary.copy(deep=True)
+        
+        s.reset_index(inplace=True)
+        for col in ('summary_date','last_report_at','operational_at'):
+            s[col] = s[col].apply(lambda x:x.isoformat())
+        
+        con = self.engine.connect()
+        #with self.engine.connect().begin() as con:
+        s.to_sql('summary',con.connection, if_exists='append')
+        con.close()
+
+        return summary
+
+    def summary(self, system_id, **kwargs):
+        '''Get the system summary'''
+
+        if not self.engine.has_table('summary'):
+            summary = self._addSummary(system_id,kwargs)
+        else:
+            q = 'select * from summary where system_id = ? and summary_date = ?'
+            con = self.engine.connect()
+
+            #summary_date defaults to midnight local time today
+            default_date = dt.datetime.combine(dt.date.today(),dt.time(0))
+            summary_date = kwargs.get('summary_date',default_date)
+            params = (system_id,summary_date.isoformat())
+            
+            summary = pd.read_sql(q, con.connection, params = params)
+
+            for col in ('summary_date','last_report_at','operational_at'):
+                summary[col] = summary[col].apply(lambda x:pd.Timestamp(x))
+            summary.set_index(['system_id','summary_date'],inplace=True)
+
+            if len(summary) < 1:
+                summary = self._addSummary(system_id,kwargs)
+            con.close()
+        return summary
+
+    def stats(self, system_id, **kwargs):
+        '''Get the 5 minute interval data for the given day'''
+
+        if not self.engine.has_table('stats'):
+            stats = self._addStats(system_id,kwargs)
+        else:
+            q = 'select * from stats where system_id = ? and end_at between ? and ?'
+            con = self.engine.connect()
+
+            default_start = dt.datetime.combine(dt.date.today(),dt.time(0))
+            default_end   = dt.datetime.combine(dt.date.today(),dt.time(0))
+            start_at = kwargs.get('start_at',default_start)
+            end_at   = kwargs.get('end_at',default_end)
+            params = (system_id,start_at.isoformat(),end_at.isoformat())
+
+            stats = pd.read_sql(q, con.connection, params = params)
+
+            for col in ('end_at',):
+                stats[col] = stats[col].apply(lambda x:pd.Timestamp(x))
+            stats.set_index(['system_id','end_at'],inplace=True)
+
+            #how to know if I've got all of them
+                stats = self._addStats(system_id,kwargs)
+            con.close()
+        return stats
+
