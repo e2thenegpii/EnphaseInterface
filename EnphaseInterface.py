@@ -47,8 +47,9 @@ class EnphaseErrorHandler(r.BaseHandler):
         diff = end.timestamp() - int(time.time())
 
         if diff < self.max_wait:
-            logging.info('Sleeping for %f seconds' % diff+1)
-            time.sleep(diff+1) #sleep +1 to prevent a second 409
+            #is there a good way to handle clock skew
+            logging.info('Sleeping for %s seconds' % str(diff+5.0))
+            time.sleep(diff+5) #sleep +5 to prevent a second 409
             return r.build_opener(self).open(req.get_full_url())
         
     def http_error_422(self, req, fp, code, msg, hdrs):
@@ -399,7 +400,6 @@ class CachingEnphaseInterface(PandasEnphaseInterface):
             s[col] = s[col].apply(lambda x:x.isoformat())
         
         con = self.engine.connect()
-        #with self.engine.connect().begin() as con:
         s.to_sql('summary',con.connection, if_exists='append')
         con.close()
 
@@ -430,20 +430,70 @@ class CachingEnphaseInterface(PandasEnphaseInterface):
             con.close()
         return summary
 
+    def _createMetaStatsTable(self,con):
+        d = [ pd.Timestamp(row[0]) 
+                for row in con.fetchall() 
+                if row[1] is 'full'] 
+        dates = set(d)
+        
+    def _addStats(self, system_id, kwargs):
+        stats = super(CachingEnphaseInterface,self)._execQuery(
+                system_id,'stats',kwargs)
+        s = stats.copy(deep=True)
+        s.reset_index(inplace=True)
+
+        con = self.engine.connect()
+
+        if 'end_at' in s.columns:
+            for col in ('end_at',):
+                s[col] = s[col].apply(lambda x:x.isoformat())
+            s.to_sql('stats',con.connection, if_exists='append')
+
+        midnight = dt.datetime.combine(dt.date.today(),dt.time(0))
+        start_at = kwargs.get('start_at',midnight)
+
+        if start_at >= midnight:
+            params = (system_id, start_at.date().isoformat(),'partial')
+        else:
+            params = (system_id, start_at.date().isoformat(),'full')
+
+        con.execute('insert into metastats values (?,?,?)', params)
+
+        con.close()
+
+        return stats
+
+    def _computeDaysToFetch(self, con, system_id, params):
+        q = '''select * from metastats where system_id = ?'''
+        result = con.execute(q, (params[0],)).fetchall()
+        
+        condition = lambda x: x[2] == 'full' and x[0] == system_id
+        observedDates = set([x[1] for x in result if condition(x)])
+        
+        datetimes = pd.DatetimeIndex(start=params[1],end=params[2],freq='D')
+        requestedDates = set([x.date().isoformat() for x in datetimes])
+
+        return requestedDates - observedDates
+
     def stats(self, system_id, **kwargs):
         '''Get the 5 minute interval data for the given day'''
 
+        con = self.engine.connect()
+
+        midnight = dt.datetime.combine(dt.date.today(),dt.time(0))
+        start_at = kwargs.get('start_at',midnight)
+        end_at   = kwargs.get('end_at',dt.datetime.now())
+        params = (system_id,start_at.isoformat(),end_at.isoformat())
+
         if not self.engine.has_table('stats'):
+            createTable = '''create table metastats(
+                [system_id] INT, [obs_date] TEXT, [obs_type] TEXT)'''
+            con.execute(createTable)
             stats = self._addStats(system_id,kwargs)
         else:
-            q = 'select * from stats where system_id = ? and end_at between ? and ?'
-            con = self.engine.connect()
-
-            default_start = dt.datetime.combine(dt.date.today(),dt.time(0))
-            default_end   = dt.datetime.combine(dt.date.today(),dt.time(0))
-            start_at = kwargs.get('start_at',default_start)
-            end_at   = kwargs.get('end_at',default_end)
-            params = (system_id,start_at.isoformat(),end_at.isoformat())
+            q = '''select * from stats 
+                    where system_id = ? and 
+                    end_at between ? and ?'''
 
             stats = pd.read_sql(q, con.connection, params = params)
 
@@ -451,8 +501,88 @@ class CachingEnphaseInterface(PandasEnphaseInterface):
                 stats[col] = stats[col].apply(lambda x:pd.Timestamp(x))
             stats.set_index(['system_id','end_at'],inplace=True)
 
-            #how to know if I've got all of them
-                stats = self._addStats(system_id,kwargs)
-            con.close()
+        daysToFetch = self._computeDaysToFetch(con, system_id, params)
+
+        if len(daysToFetch) > 0:
+            kwargs.pop('end_at',0)
+            results = [stats]
+            for day in daysToFetch:
+                start = dt.datetime.combine(pd.Timestamp(day),dt.time(0))
+                kwargs['start_at'] = start
+                s = self._addStats(system_id,kwargs)
+                if 'end_at' in s.columns:
+                    results.append(s)
+            stats = pd.concat(results).drop_duplicates()
+        con.close()
         return stats
 
+    def getAllStats(self, system_id):
+        summary = self.summary(system_id,no_cache=True)
+        return self.stats(system_id,
+            start_at=summary['operational_at'].iloc[0],
+            end_at = summary['last_report_at'].iloc[0])
+
+    def _addEnvoys(self, system_id, kwargs):
+        envoys = super(CachingEnphaseInterface,self)._execQuery(
+            system_id,'envoys',kwargs)
+        e = envoys.copy(deep=True)
+
+        e.reset_index(inplace=True)
+        for col in ('last_report_at',):
+            e[col] = e[col].apply(lambda x:x.isoformat())
+
+        con = self.engine.connect()
+        e.to_sql('envoys',con.connection, if_exists='append')
+        con.close()
+
+        return envoys
+
+    def envoys(self,system_id, no_cache=False, **kwargs):
+        if no_cache is True:
+            envoys = super(CachingEnphaseInterface,self)._execQuery(
+                system_id,'envoys', kwargs)
+        elif not self.engine.has_table('envoys'):
+            envoys = self._addEnvoys(system_id,kwargs)
+        else:
+            q = 'select * from envoys where system_id = ?'
+            con = self.engine.connect()
+
+            envoys = pd.read_sql(q, con.connection, params = (system_id,))
+
+            for col in ('last_report_at',):
+                envoys[col] = envoys[col].apply(lambda x:pd.Timestamp(x))
+            envoys.set_index(['system_id','serial_number'],inplace=True)
+
+            if len(envoys) < 1:
+                envoys = self._addEnvoys(system_id,kwargs)
+            con.close()
+        return envoys
+
+
+    def summary(self, system_id, no_cache=False, **kwargs):
+        '''Get the system summary'''
+
+        if no_cache is True:
+            summary = super(CachingEnphaseInterface,self)._execQuery(
+                system_id,'summary',kwargs)
+        elif not self.engine.has_table('summary'):
+            summary = self._addSummary(system_id,kwargs)
+        else:
+            q = 'select * from summary where system_id = ? and summary_date = ?'
+            con = self.engine.connect()
+
+            #summary_date defaults to midnight local time today
+            default_date = dt.datetime.combine(dt.date.today(),dt.time(0))
+            summary_date = kwargs.get('summary_date',default_date)
+            params = (system_id,summary_date.isoformat())
+            
+            summary = pd.read_sql(q, con.connection, params = params)
+
+            for col in ('summary_date','last_report_at','operational_at'):
+                summary[col] = summary[col].apply(lambda x:pd.Timestamp(x))
+            summary.set_index(['system_id','summary_date'],inplace=True)
+
+            if len(summary) < 1:
+                summary = self._addSummary(system_id,kwargs)
+            con.close()
+        return summary
