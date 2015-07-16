@@ -183,6 +183,11 @@ class RawEnphaseInterface(object):
         response = self.opener.open(req).read()
         logging.debug(response.decode('UTF-8'))
         return response
+
+    def _filterAttributes(self,attrs,kwargs):
+        globalAttrs = ('datetime_format','callback','user_id','key')
+        valids = [ (k,v) for k,v in kwargs.items() if k in attrs+globalAttrs ]
+        return dict(valids)
         
     def setDateTimeType(self, dtt):
         '''Set the timestamp type for the Enphase API'''
@@ -244,52 +249,62 @@ class RawEnphaseInterface(object):
     def energy_lifetime(self, system_id, **kwargs):
         '''Get the lifetime energy produced by the system'''
 
-        return self._execQuery(system_id, 'energy_lifetime', kwargs)
+        validArgs = self._filterAttributes(('start_date','end_date'),kwargs)
+        return self._execQuery(system_id, 'energy_lifetime', validArgs)
 
     def envoys(self, system_id, **kwargs):
         '''List the envoys associated with the system'''
 
-        return self._execQuery(system_id, 'envoys', kwargs)
+        validArgs = self._filterAttributes(tuple(),kwargs)
+        return self._execQuery(system_id, 'envoys', validArgs)
     
     def index(self, **kwargs):
         '''List the systems available by this API key'''
 
         sysAttributes = ['system_id', 'system_name', 'status', 'reference', 
                             'installer', 'connection_type']
+        validArgs = self._filterAttributes(tuple(sysAttributes),kwargs)
 
-        uset = set(kwargs.keys()) & set(sysAttributes)
+        uset = set(validArgs.keys()) & set(sysAttributes)
         if len(uset) > 1:
             for x in uset:
-                kwargs[x+'[]'] = kwargs.pop(x)
+                validArgs[x+'[]'] = validArgs.pop(x)
 
-        return self._execQuery('', '', kwargs)
+        return self._execQuery('', '', validArgs)
 
     def inventory(self, system_id, **kwargs):
         '''List the inverters associated with this system'''
-
-        return self._execQuery(system_id, 'inventory', kwargs)
+        
+        validArgs = self._filterAttributes(tuple(),kwargs)
+        return self._execQuery(system_id, 'inventory', validArgs)
 
     def monthly_production(self, system_id, **kwargs):
         '''List the energy produced in the last month'''
 
-        if 'start_date' not in kwargs:
+        validArgs = self._filterAttributes(('start_date',),kwargs)
+
+        if 'start_date' not in validArgs:
             raise AttributeError('start_date required parameter')
-        return self._execQuery(system_id, 'monthly_production', kwargs)
+        return self._execQuery(system_id, 'monthly_production', validArgs)
 
     def rgm_stats(self, system_id, **kwargs):
         '''List the Revenue Grade Meter stats'''
 
-        return self._execQuery(system_id, 'rgm_stats', kwargs)
+        validArgs = self._filterAttributes(('start_at','end_at'),kwargs)
+        return self._execQuery(system_id, 'rgm_stats', validArgs)
 
     def stats(self, system_id, **kwargs):
         '''Get the 5 minute interval data for the given day'''
 
-        return self._execQuery(system_id, 'stats', kwargs)
+
+        validArgs = self._filterAttributes(('start_at','end_at'),kwargs)
+        return self._execQuery(system_id, 'stats', validArgs)
 
     def summary(self, system_id, **kwargs):
         '''Get the system summary'''
 
-        return self._execQuery(system_id, 'summary', kwargs)
+        validArgs = self._filterAttributes(('summary_date',),kwargs)
+        return self._execQuery(system_id, 'summary', validArgs)
 
 class JsonEnphaseInterface(RawEnphaseInterface):
     def _execQuery(self, system_id, command, extraParams = dict()):
@@ -305,7 +320,7 @@ class PandasEnphaseInterface(JsonEnphaseInterface):
         logging.debug(data)
 
         if command == 'energy_lifetime':
-            output = self._energy_lifetime(data,dtt)
+            output = self._energy_lifetime(data)
         elif command == 'envoys':
             output = self._envoys(data)
         elif command == 'index' or command == '':
@@ -444,20 +459,32 @@ class CachingEnphaseInterface(PandasEnphaseInterface):
 
         con = self.engine.connect()
 
+        midnight = dt.datetime.combine(dt.date.today(),dt.time(0))
+        start_at = kwargs.get('start_at',midnight)
+
+        saiso = start_at.date().isoformat()
+        eaiso = (start_at + dt.timedelta(1)).date().isoformat()
+
+        if start_at >= midnight:
+            params = (system_id, saiso,'partial')
+        else:
+            params = (system_id, saiso,'full')
+
+        #check if the row is in the table
+        if self._isObservationPresent(con, 'metastats', system_id, 
+                saiso):
+            q = '''update metastats set obs_type=? where system_id=? and
+                obs_date=?'''
+            con.execute(q,(params[2],params[0],params[1]))
+            q2 = '''delete from stats where end_at between ? and ?'''
+            con.execute(q2,(saiso,eaiso))
+        else:
+            con.execute('insert into metastats values (?,?,?)', params)
+
         if 'end_at' in s.columns:
             for col in ('end_at',):
                 s[col] = s[col].apply(lambda x:x.isoformat())
             s.to_sql('stats',con.connection, if_exists='append')
-
-        midnight = dt.datetime.combine(dt.date.today(),dt.time(0))
-        start_at = kwargs.get('start_at',midnight)
-
-        if start_at >= midnight:
-            params = (system_id, start_at.date().isoformat(),'partial')
-        else:
-            params = (system_id, start_at.date().isoformat(),'full')
-
-        con.execute('insert into metastats values (?,?,?)', params)
 
         con.close()
 
@@ -475,6 +502,11 @@ class CachingEnphaseInterface(PandasEnphaseInterface):
 
         return requestedDates - observedDates
 
+    def _isObservationPresent(self, con, table, system_id, obs_date):
+        q = '''select * from %s where system_id=? and obs_date=?'''
+        result = con.execute(q%table, (system_id,obs_date)).fetchall()
+        return len(result)>0
+
     def stats(self, system_id, **kwargs):
         '''Get the 5 minute interval data for the given day'''
 
@@ -487,7 +519,7 @@ class CachingEnphaseInterface(PandasEnphaseInterface):
 
         if not self.engine.has_table('stats'):
             createTable = '''create table metastats(
-                [system_id] INT, [obs_date] TEXT, [obs_type] TEXT)'''
+                [system_id] INT, [obs_date] TEXT UNIQUE, [obs_type] TEXT)'''
             con.execute(createTable)
             stats = self._addStats(system_id,kwargs)
         else:
