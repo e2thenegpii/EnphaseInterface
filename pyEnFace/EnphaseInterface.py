@@ -13,6 +13,7 @@ import pandas as pd
 from pandas.io.json import json_normalize
 from enum import Enum
 import sqlalchemy as sa
+from functools import partial
 
 APIV2 = 'https://api.enphaseenergy.com/api/v2'
 APIKEY = ''
@@ -338,7 +339,8 @@ class PandasEnphaseInterface(JsonEnphaseInterface):
         else:
             raise ValueError('datatype parameter not supported')
 
-        return self._datetimeify(output)
+        indexes = output.index.names
+        return self._datetimeify(output).set_index(indexes)
 
     def _energy_lifetime(self,data):
         d = json_normalize(data, 'production',['start_date','system_id'])
@@ -389,151 +391,150 @@ class PandasEnphaseInterface(JsonEnphaseInterface):
     def _summary(self,data):
         return json_normalize(data).set_index(['system_id','summary_date'])
 
+
     def _datetimeify(self,output):
-        indexes = output.index.names
         output.reset_index(inplace=True)
         for col in output.columns:
             if '_at' in col or '_date' in col:
                 output[col] = output[col].apply(
                     lambda x:self.dtt.datetimeify(col,x))
-        return output.set_index(indexes)
+        return output
 
 class CachingEnphaseInterface(PandasEnphaseInterface):
     def __init__(self, userId, max_wait=DEFAULT_MAX_WAIT, 
-        engine = sa.create_engine('sqlite://')):
-            super(CachingEnphaseInterface,self).__init__(
-                    userId, max_wait)
-            self.engine = engine
+            engine = sa.create_engine('sqlite://')):
+        super(CachingEnphaseInterface,self).__init__(
+                userId, max_wait)
+        self.engine = engine
 
-    def _addSummary(self, system_id, kwargs):
-        summary = super(CachingEnphaseInterface,self)._execQuery(
-            system_id,'summary',kwargs)
-        s = summary.copy(deep=True)
-        
-        s.reset_index(inplace=True)
-        for col in ('summary_date','last_report_at','operational_at'):
-            s[col] = s[col].apply(lambda x:x.isoformat())
-        
-        con = self.engine.connect()
-        s.to_sql('summary',con.connection, if_exists='append')
-        con.close()
+        self.createTables()
 
-        return summary
+    @staticmethod
+    def convertTimestamps(frame,output):
 
-    def summary(self, system_id, **kwargs):
+        if output == 'sql':
+            f = lambda x:x.isoformat()
+        elif output == 'output':
+            f = lambda x:pd.Timestamp(x)
+        else:
+            raise ValueError('output must be one of (sql,output)')
+
+        for col in frame.columns:
+            if col.endswith('_at') or col.endswith('_date'):
+                frame[col] = frame[col].apply(f)
+        return frame
+
+    def createTables(self):
+
+        t = {}
+
+        t['stats']      = '''CREATE TABLE stats (
+                            [system_id] INTEGER,
+                            [end_at] TEXT UNIQUE ON CONFLICT IGNORE,
+                            [devices_reporting] INTEGER,
+                            [enwh] INTEGER,
+                            [powr] INTEGER,
+                            [total_devices] INTEGER)'''
+        t['rgm_stats']  = '''CREATE TABLE rgm_stats (
+                            [system_id] INTEGER,
+                            [end_at] TEXT UNIQUE ON CONFLICT IGNORE,
+                            [devices_reporting] INTEGER,
+                            [wh_del] INTEGER,
+                            [total_devices] INTEGER)'''
+        t['summary']    = '''CREATE TABLE summary (
+                            [system_id] INTEGER,
+                            [summary_date] TEXT UNIQUE ON CONFLICT IGNORE,
+                            [current_power] INTEGER,
+                            [energy_lifetime] INTEGER,
+                            [energy_today] INTEGER,
+                            [last_report_at] TEXT,
+                            [modules] INTEGER,
+                            [operational_at] TEXT,
+                            [size_w] INTEGER,
+                            [source] TEXT,
+                            [status] TEXT)'''
+        t['envoys']     = '''CREATE TABLE envoys (
+                            [system_id] INTEGER,
+                            [serial_number] TEXT,
+                            [envoy_id] INTEGER,
+                            [last_report_at] TEXT,
+                            [name] TEXT,
+                            [part_number] TEXT,
+                            [status] TEXT)'''
+        t['metastats']  = '''CREATE TABLE metastats (
+                            [system_id] INT,
+                            [obs_date] TEXT UNIQUE ON CONFLICT REPLACE,
+                            [obs_type] TEXT)'''
+        t['metargm_stats']='''CREATE TABLE metargm_stats (
+                            [system_id] INT,
+                            [obs_date] TEXT UNIQUE ON CONFLICT REPLACE,
+                            [obs_type] TEXT)'''
+
+        with self.engine.connect() as con:
+            for k,v in t.items():
+                if not self.engine.has_table(k):
+                    con.execute(v)
+
+    def summary(self, system_id, no_cache = False, **kwargs):
         '''Get the system summary'''
 
-        if not self.engine.has_table('summary'):
-            summary = self._addSummary(system_id,kwargs)
-        else:
-            q = 'select * from summary where system_id = ? and summary_date = ?'
-            con = self.engine.connect()
+        if no_cache is True:
+            summary = super(CachingEnphaseInterface,self)._execQuery(
+                system_id,'summary',kwargs)
 
-            #summary_date defaults to midnight local time today
-            default_date = dt.datetime.combine(dt.date.today(),dt.time(0))
-            summary_date = kwargs.get('summary_date',default_date)
-            params = (system_id,summary_date.isoformat())
-            
+        q = 'select * from summary where system_id = ? and summary_date = ?'
+
+        #summary_date defaults to midnight local time today
+        default_date = dt.datetime.combine(dt.date.today(),dt.time(0))
+        summary_date = kwargs.get('summary_date',default_date)
+        params = (system_id,summary_date.isoformat())
+        
+        with self.engine.connect() as con:
             summary = pd.read_sql(q, con.connection, params = params)
 
-            for col in ('summary_date','last_report_at','operational_at'):
-                summary[col] = summary[col].apply(lambda x:pd.Timestamp(x))
+        if len(summary) < 1:
+            summary = super(CachingEnphaseInterface,self)._execQuery(
+                system_id,'summary',kwargs)
+            s = summary.copy(deep=True)
+
+            s.reset_index(inplace=True)
+            self.convertTimestamps(s,'sql')
+            
+            with self.engine.connect() as con:
+                s.to_sql('summary',con.connection, if_exists='append')
+        else:
+            summary = self.convertTimestamps(summary,'output')
             summary.set_index(['system_id','summary_date'],inplace=True)
 
-            if len(summary) < 1:
-                summary = self._addSummary(system_id,kwargs)
-            con.close()
         return summary
 
-    def _createMetaStatsTable(self,con):
-        d = [ pd.Timestamp(row[0]) 
-                for row in con.fetchall() 
-                if row[1] is 'full'] 
-        dates = set(d)
-        
-    def _addStats(self, system_id, kwargs):
-        stats = super(CachingEnphaseInterface,self)._execQuery(
-                system_id,'stats',kwargs)
-        s = stats.copy(deep=True)
-        s.reset_index(inplace=True)
-
-        con = self.engine.connect()
-
-        midnight = dt.datetime.combine(dt.date.today(),dt.time(0))
-        start_at = kwargs.get('start_at',midnight)
-
-        saiso = start_at.date().isoformat()
-        eaiso = (start_at + dt.timedelta(1)).date().isoformat()
-
-        if start_at >= midnight:
-            params = (system_id, saiso,'partial')
-        else:
-            params = (system_id, saiso,'full')
-
-        #check if the row is in the table
-        if self._isObservationPresent(con, 'metastats', system_id, 
-                saiso):
-            q = '''update metastats set obs_type=? where system_id=? and
-                obs_date=?'''
-            con.execute(q,(params[2],params[0],params[1]))
-            q2 = '''delete from stats where end_at between ? and ?'''
-            con.execute(q2,(saiso,eaiso))
-        else:
-            con.execute('insert into metastats values (?,?,?)', params)
-
-        if 'end_at' in s.columns:
-            for col in ('end_at',):
-                s[col] = s[col].apply(lambda x:x.isoformat())
-            s.to_sql('stats',con.connection, if_exists='append')
-
-        con.close()
-
-        return stats
-
-    def _computeDaysToFetch(self, con, system_id, params):
-        q = '''select * from metastats where system_id = ?'''
-        result = con.execute(q, (params[0],)).fetchall()
-        
-        condition = lambda x: x[2] == 'full' and x[0] == system_id
-        observedDates = set([x[1] for x in result if condition(x)])
-        
-        datetimes = pd.DatetimeIndex(start=params[1],end=params[2],freq='D')
-        requestedDates = set([x.date().isoformat() for x in datetimes])
-
-        return requestedDates - observedDates
-
-    def _isObservationPresent(self, con, table, system_id, obs_date):
-        q = '''select * from %s where system_id=? and obs_date=?'''
-        result = con.execute(q%table, (system_id,obs_date)).fetchall()
-        return len(result)>0
-
-    def stats(self, system_id, **kwargs):
-        '''Get the 5 minute interval data for the given day'''
-
-        con = self.engine.connect()
+    def _istats(self, system_id, table, kwargs):
 
         midnight = dt.datetime.combine(dt.date.today(),dt.time(0))
         start_at = kwargs.get('start_at',midnight)
         end_at   = kwargs.get('end_at',dt.datetime.now())
         params = (system_id,start_at.isoformat(),end_at.isoformat())
 
-        if not self.engine.has_table('stats'):
-            createTable = '''create table metastats(
-                [system_id] INT, [obs_date] TEXT UNIQUE, [obs_type] TEXT)'''
-            con.execute(createTable)
-            stats = self._addStats(system_id,kwargs)
-        else:
-            q = '''select * from stats 
-                    where system_id = ? and 
-                    end_at between ? and ?'''
+        q = '''select * from %s where system_id = ? and 
+                end_at between ? and ?''' % table
 
+        with self.engine.connect() as con:
             stats = pd.read_sql(q, con.connection, params = params)
 
-            for col in ('end_at',):
-                stats[col] = stats[col].apply(lambda x:pd.Timestamp(x))
-            stats.set_index(['system_id','end_at'],inplace=True)
+        self.convertTimestamps(stats,'output')
+        stats.set_index(['system_id','end_at'],inplace=True)
+        
+        q = '''select * from %s where system_id = ?''' % ('meta'+table)
+        with self.engine.connect() as con:
+            result = con.execute(q, (system_id,)).fetchall()
 
-        daysToFetch = self._computeDaysToFetch(con, system_id, params)
+        condition = lambda x:x[2] == 'full' and x[0] == system_id
+        observedDates = set([x[1] for x in result if condition(x)])
+
+        datetimes = pd.DatetimeIndex(start=start_at,end=end_at,freq='D')
+        requestedDates = set([x.date().isoformat() for x in datetimes])
+
+        daysToFetch = requestedDates - observedDates
 
         if len(daysToFetch) > 0:
             kwargs.pop('end_at',0)
@@ -541,12 +542,38 @@ class CachingEnphaseInterface(PandasEnphaseInterface):
             for day in daysToFetch:
                 start = dt.datetime.combine(pd.Timestamp(day),dt.time(0))
                 kwargs['start_at'] = start
-                s = self._addStats(system_id,kwargs)
+
+                tstats = super(CachingEnphaseInterface,self)._execQuery(
+                    system_id,table,kwargs)
+                s = tstats.copy(deep=True)
+                s.reset_index(inplace=True)
+                self.convertTimestamps(s,'sql')
+
+                start_at = kwargs.get('start_at',midnight)
+
+                if start_at >= midnight:
+                    params = (system_id, start_at.date().isoformat(),'partial')
+                else:
+                    params = (system_id, start_at.date().isoformat(),'full')
+
+                with self.engine.connect() as con:
+                    s.to_sql(table,con.connection, if_exists='append')
+                    q = '''insert into %s values (?,?,?)'''%('meta'+table)
+                    con.execute(q,params)
+
                 if 'end_at' in s.columns:
-                    results.append(s)
+                    results.append(tstats)
             stats = pd.concat(results).drop_duplicates()
-        con.close()
         return stats
+
+    def stats(self, system_id, **kwargs):
+        '''Get the 5 minute interval data for the given day'''
+
+        return self._istats(system_id, 'stats', kwargs)
+
+    def rgm_stats(self, system_id, **kwargs):
+
+        return self._istats(system_id, 'rgm_stats', kwargs)
 
     def getAllStats(self, system_id):
         summary = self.summary(system_id,no_cache=True)
@@ -554,67 +581,50 @@ class CachingEnphaseInterface(PandasEnphaseInterface):
             start_at=summary['operational_at'].iloc[0],
             end_at = summary['last_report_at'].iloc[0])
 
-    def _addEnvoys(self, system_id, kwargs):
-        envoys = super(CachingEnphaseInterface,self)._execQuery(
-            system_id,'envoys',kwargs)
-        e = envoys.copy(deep=True)
-
-        e.reset_index(inplace=True)
-        for col in ('last_report_at',):
-            e[col] = e[col].apply(lambda x:x.isoformat())
-
-        con = self.engine.connect()
-        e.to_sql('envoys',con.connection, if_exists='append')
-        con.close()
-
-        return envoys
-
     def envoys(self,system_id, no_cache=False, **kwargs):
         if no_cache is True:
             envoys = super(CachingEnphaseInterface,self)._execQuery(
                 system_id,'envoys', kwargs)
-        elif not self.engine.has_table('envoys'):
-            envoys = self._addEnvoys(system_id,kwargs)
         else:
             q = 'select * from envoys where system_id = ?'
             con = self.engine.connect()
 
-            envoys = pd.read_sql(q, con.connection, params = (system_id,))
+            with self.engine.connect() as con:
+                envoys = pd.read_sql(q, con.connection, params = (system_id,))
 
-            for col in ('last_report_at',):
-                envoys[col] = envoys[col].apply(lambda x:pd.Timestamp(x))
+            self.convertTimestamps(envoys,'output')
             envoys.set_index(['system_id','serial_number'],inplace=True)
 
             if len(envoys) < 1:
-                envoys = self._addEnvoys(system_id,kwargs)
-            con.close()
+                envoys = super(CachingEnphaseInterface,self)._execQuery(
+                    system_id,'envoys',kwargs)
+                e = envoys.copy(deep=True)
+
+                e.reset_index(inplace=True)
+                self.convertTimestamps(e,'sql')
+
+                with self.engine.connect() as con:
+                    e.to_sql('envoys',con.connection, if_exists='append')
         return envoys
 
-
-    def summary(self, system_id, no_cache=False, **kwargs):
-        '''Get the system summary'''
-
+    def energy_lifetime(self, system_id, no_cache=False, **kwargs):
+        q = 'select * from energy_lifetime where system_id = ?'
+        con = self.engine.connect()
         if no_cache is True:
-            summary = super(CachingEnphaseInterface,self)._execQuery(
-                system_id,'summary',kwargs)
-        elif not self.engine.has_table('summary'):
-            summary = self._addSummary(system_id,kwargs)
+            el = super(CachingEnphaseInterface,self)._execQuery(
+                system_id,'energy_lifetime',kwargs)
         else:
-            q = 'select * from summary where system_id = ? and summary_date = ?'
-            con = self.engine.connect()
+            raise NotImplemented()
+            el = pd.read_sql(q, con.connection, params = (system_id,))
 
-            #summary_date defaults to midnight local time today
-            default_date = dt.datetime.combine(dt.date.today(),dt.time(0))
-            summary_date = kwargs.get('summary_date',default_date)
-            params = (system_id,summary_date.isoformat())
-            
-            summary = pd.read_sql(q, con.connection, params = params)
+            for col in ('start_date',):
+                el[col] = el[col].apply(lambda x:pd.Timestamp(x))
+            el.set_index(['system_id','start_date'],inplace=True)
 
-            for col in ('summary_date','last_report_at','operational_at'):
-                summary[col] = summary[col].apply(lambda x:pd.Timestamp(x))
-            summary.set_index(['system_id','summary_date'],inplace=True)
+            for col in ('start_date',):
+                el[col] = el[col].apply(lambda x:x.isoformat())
+            el.to_sql('energy_lifetime', con.connection, if_exists='replace')
 
-            if len(summary) < 1:
-                summary = self._addSummary(system_id,kwargs)
-            con.close()
-        return summary
+        con.close()
+        return el
+
