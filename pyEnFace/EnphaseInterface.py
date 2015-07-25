@@ -6,17 +6,17 @@ import dateutil.parser as dp
 import json
 import time
 import logging
+import collections
 
 from lxml import etree as et
-from pandas import Series,to_timedelta,to_datetime,concat,DataFrame
+from pandas import Series,to_timedelta,to_datetime,concat
 import pandas as pd
 from pandas.io.json import json_normalize
 from enum import Enum
-import sqlalchemy as sa
-from functools import partial
+from sqlalchemy import create_engine
 
 APIV2 = 'https://api.enphaseenergy.com/api/v2'
-APIKEY = ''
+APIKEYRING = collections.deque()
 
 DEFAULT_MAX_WAIT = 60
 
@@ -27,15 +27,15 @@ class EnphaseErrorHandler(r.BaseHandler):
         self.dtt = datetimetype
         self.max_wait = max_wait
         logging.debug('Initialized EnphaseErrorHandler')
-    
+
     def setMaxWait(self, max_wait):
         self.max_wait = max_wait
         logging.debug('Set max_wait to %d' % self.max_wait)
-        
+
     def setDateTimeType(self, dtt):
         self.dtt = dtt
         logging.debug('Set DateTimeType to %s' % self.dtt.value)
-        
+
     def http_error_409(self, req, fp, code, msg, hdrs):
 
         s = fp.read().decode(encoding='UTF-8')
@@ -52,12 +52,12 @@ class EnphaseErrorHandler(r.BaseHandler):
             logging.info('Sleeping for %s seconds' % str(diff+5.0))
             time.sleep(diff+5) #sleep +5 to prevent a second 409
             return r.build_opener(self).open(req.get_full_url())
-        
+
     def http_error_422(self, req, fp, code, msg, hdrs):
 
         s = fp.read().decode(encoding='UTF-8')
         data = json.loads(s)
-        
+
         logging.info('Received HTTP Error 422')
         logging.debug(data)
 
@@ -96,10 +96,10 @@ class DateTimeType(Enum):
     Enphase = 'enphase'
     Iso8601 = 'iso8601'
     Epoch   = 'epoch'
-    
+
     def stringify(self, key, value):
         '''Convert the datetime values to the correct format'''
-        
+
         d = value.replace(microsecond=0)
         if self is DateTimeType.Enphase:
             if '_date' in key:
@@ -111,24 +111,24 @@ class DateTimeType(Enum):
         elif self is DateTimeType.Epoch:
             return str(int(d.timestamp()))
         logging.warning('Failed to stringify %s' % value)
-            
+
     def datetimeify(self, key, value):
         '''Convert an Enphase timestamp or time string to a datetime'''
-        
+
         if self is DateTimeType.Enphase:
             if '_date' in key:
                 return dt.datetime.strptime(value,'%Y-%m-%d')
             else:
                 return dt.datetime.fromtimestamp(value)
         elif self is DateTimeType.Iso8601:
-            return dp.parser.parse(value) 
+            return dp.parser.parse(value)
         elif self is DateTimeType.Epoch:
             return dt.datetime.fromtimestamp(value)
         logging.warning('Failed to datetimeify %s' % value)
-        
+
     def sanatizeTimes(self, query):
         '''Make sure the datetime values are sane'''
-        
+
         if 'start_at' in query and 'end_at' in query:
             if query['start_at'] > query['end_at']:
                 logging.error('The value for start_at is after end_at')
@@ -149,17 +149,20 @@ class RawEnphaseInterface(object):
     '''Interfaces with the Enphase api and returns the raw json
         It expects all dates and times to be in a child of a datetime type'''
 
-    def __init__(self, userId, max_wait=DEFAULT_MAX_WAIT):
-        if APIKEY == '':
-            raise ValueError("APIKEY not set")
+    def __init__(self, userId, max_wait=DEFAULT_MAX_WAIT,
+            useragent='Mozilla/5.0', datetimeType=DateTimeType.Enphase,
+            errorhandler=None):
 
-        self.parameters = { 'user_id': userId,
-                            'key': APIKEY }
+        if errorhandler==None:
+            errorhandler=EnphaseErrorHandler(datetimeType,max_wait)
 
-        self.dtt = DateTimeType.Enphase
-        self.handler = EnphaseErrorHandler(self.dtt, max_wait)
-                            
+        self.userId = userId
+
+        self.dtt = datetimeType
+        self.handler = errorhandler
+
         self.opener = r.build_opener(self.handler)
+        self.opener.addheaders = [('User-agent',useragent)]
         self.apiDest = APIV2
 
     def _execQuery(self, system_id, command, extraParams = dict()):
@@ -170,7 +173,10 @@ class RawEnphaseInterface(object):
         if command is not '':
             command = '/' + command
 
-        query = dict(self.parameters)
+        try:
+            query = {'user_id':self.userId,'key':APIKEYRING[0]}
+        except IndexError:
+            raise ValueError('Must register at least one key with APIKEYRING')
         query.update(extraParams)
 
         self.dtt.sanatizeTimes(query)
@@ -179,7 +185,7 @@ class RawEnphaseInterface(object):
 
         query = self.apiDest + '/systems' + system_id + command + '?' + q
         req = r.Request(query, headers={'Content-Type':'application/json'})
-        
+
         logging.debug('GET %s' % query)
         response = self.opener.open(req).read()
         logging.debug(response.decode('UTF-8'))
@@ -189,16 +195,16 @@ class RawEnphaseInterface(object):
         globalAttrs = ('datetime_format','callback','user_id','key')
         valids = [ (k,v) for k,v in kwargs.items() if k in attrs+globalAttrs ]
         return dict(valids)
-        
+
     def setDateTimeType(self, dtt):
         '''Set the timestamp type for the Enphase API'''
 
         self.parameters['datetime_format'] = dtt.value
         self.handler.setDateTimeType(dtt)
-        
+
         if dtt is DateTimeType.Enphase:
             self.parameters.pop('datetime_format',None)
-            
+
     @staticmethod
     def _processPage(request):
         logging.debug(request.geturl())
@@ -258,11 +264,11 @@ class RawEnphaseInterface(object):
 
         validArgs = self._filterAttributes(tuple(),kwargs)
         return self._execQuery(system_id, 'envoys', validArgs)
-    
+
     def index(self, **kwargs):
         '''List the systems available by this API key'''
 
-        sysAttributes = ['system_id', 'system_name', 'status', 'reference', 
+        sysAttributes = ['system_id', 'system_name', 'status', 'reference',
                             'installer', 'connection_type']
         validArgs = self._filterAttributes(tuple(sysAttributes),kwargs)
 
@@ -275,7 +281,7 @@ class RawEnphaseInterface(object):
 
     def inventory(self, system_id, **kwargs):
         '''List the inverters associated with this system'''
-        
+
         validArgs = self._filterAttributes(tuple(),kwargs)
         return self._execQuery(system_id, 'inventory', validArgs)
 
@@ -401,28 +407,13 @@ class PandasEnphaseInterface(JsonEnphaseInterface):
         return output
 
 class CachingEnphaseInterface(PandasEnphaseInterface):
-    def __init__(self, userId, max_wait=DEFAULT_MAX_WAIT, 
-            engine = sa.create_engine('sqlite://')):
+    def __init__(self, userId, max_wait=DEFAULT_MAX_WAIT,
+            engine = create_engine('sqlite://')):
         super(CachingEnphaseInterface,self).__init__(
                 userId, max_wait)
         self.engine = engine
 
         self.createTables()
-
-    @staticmethod
-    def convertTimestamps(frame,output):
-
-        if output == 'sql':
-            f = lambda x:x.isoformat()
-        elif output == 'output':
-            f = lambda x:pd.Timestamp(x)
-        else:
-            raise ValueError('output must be one of (sql,output)')
-
-        for col in frame.columns:
-            if col.endswith('_at') or col.endswith('_date'):
-                frame[col] = frame[col].apply(f)
-        return frame
 
     def createTables(self):
 
@@ -481,30 +472,27 @@ class CachingEnphaseInterface(PandasEnphaseInterface):
         if no_cache is True:
             summary = super(CachingEnphaseInterface,self)._execQuery(
                 system_id,'summary',kwargs)
-
-        q = 'select * from summary where system_id = ? and summary_date = ?'
-
-        #summary_date defaults to midnight local time today
-        default_date = dt.datetime.combine(dt.date.today(),dt.time(0))
-        summary_date = kwargs.get('summary_date',default_date)
-        params = (system_id,summary_date.isoformat())
-        
-        with self.engine.connect() as con:
-            summary = pd.read_sql(q, con.connection, params = params)
-
-        if len(summary) < 1:
-            summary = super(CachingEnphaseInterface,self)._execQuery(
-                system_id,'summary',kwargs)
-            s = summary.copy(deep=True)
-
-            s.reset_index(inplace=True)
-            self.convertTimestamps(s,'sql')
-            
-            with self.engine.connect() as con:
-                s.to_sql('summary',con.connection, if_exists='append')
         else:
-            summary = self.convertTimestamps(summary,'output')
-            summary.set_index(['system_id','summary_date'],inplace=True)
+            q = 'select * from summary where system_id = ? and summary_date = ?'
+
+            #summary_date defaults to midnight local time today
+            default_date = dt.datetime.combine(dt.date.today(),dt.time(0))
+            summary_date = kwargs.get('summary_date',default_date)
+            params = (system_id,summary_date.isoformat())
+
+            with self.engine.connect() as con:
+                summary = pd.read_sql(
+                        q, 
+                        con.connection, 
+                        index_col=['system_id','summary_date'], 
+                        parse_dates=['summary_date'],
+                        params = params)
+
+                if len(summary) < 1:
+                    summary = super(CachingEnphaseInterface,self)._execQuery(
+                        system_id,'summary',kwargs)
+
+                    summary.to_sql('summary',con.connection, if_exists='append')
 
         return summary
 
@@ -515,15 +503,23 @@ class CachingEnphaseInterface(PandasEnphaseInterface):
         end_at   = kwargs.get('end_at',dt.datetime.now())
         params = (system_id,start_at.isoformat(),end_at.isoformat())
 
+        no_cache = kwargs.get('no_cache',False)
+
+        if no_cache == True:
+            return super(CachingEnphaseInterface,self)._execQuery(
+                system_id,table,kwargs)
+
         q = '''select * from %s where system_id = ? and 
                 end_at between ? and ?''' % table
 
         with self.engine.connect() as con:
-            stats = pd.read_sql(q, con.connection, params = params)
+            stats = pd.read_sql(
+                    q, 
+                    con.connection, 
+                    params = params,
+                    index_col=['system_id','end_at'],
+                    parse_dates=['end_at'])
 
-        self.convertTimestamps(stats,'output')
-        stats.set_index(['system_id','end_at'],inplace=True)
-        
         q = '''select * from %s where system_id = ?''' % ('meta'+table)
         with self.engine.connect() as con:
             result = con.execute(q, (system_id,)).fetchall()
@@ -540,16 +536,12 @@ class CachingEnphaseInterface(PandasEnphaseInterface):
             kwargs.pop('end_at',0)
             results = [stats]
             for day in daysToFetch:
-                start = dt.datetime.combine(pd.Timestamp(day),dt.time(0))
-                kwargs['start_at'] = start
+                start_at = dt.datetime.combine(pd.Timestamp(day),dt.time(0))
+                logging.debug('Fetching %s'%start_at.isoformat())
+                kwargs['start_at'] = start_at
 
                 tstats = super(CachingEnphaseInterface,self)._execQuery(
                     system_id,table,kwargs)
-                s = tstats.copy(deep=True)
-                s.reset_index(inplace=True)
-                self.convertTimestamps(s,'sql')
-
-                start_at = kwargs.get('start_at',midnight)
 
                 if start_at >= midnight:
                     params = (system_id, start_at.date().isoformat(),'partial')
@@ -557,12 +549,13 @@ class CachingEnphaseInterface(PandasEnphaseInterface):
                     params = (system_id, start_at.date().isoformat(),'full')
 
                 with self.engine.connect() as con:
-                    s.to_sql(table,con.connection, if_exists='append')
                     q = '''insert into %s values (?,?,?)'''%('meta'+table)
                     con.execute(q,params)
+                    if 'intervals' in tstats.columns:
+                        continue
+                    tstats.to_sql(table,con.connection, if_exists='append')
 
-                if 'end_at' in s.columns:
-                    results.append(tstats)
+                results.append(tstats)
             stats = pd.concat(results).drop_duplicates()
         return stats
 
@@ -587,44 +580,20 @@ class CachingEnphaseInterface(PandasEnphaseInterface):
                 system_id,'envoys', kwargs)
         else:
             q = 'select * from envoys where system_id = ?'
-            con = self.engine.connect()
 
             with self.engine.connect() as con:
-                envoys = pd.read_sql(q, con.connection, params = (system_id,))
+                envoys = pd.read_sql(
+                        q, 
+                        con.connection, 
+                        params = (system_id,),
+                        index_col=['system_id','serial_number'],
+                        parse_dates=['last_report_at'])
 
-            self.convertTimestamps(envoys,'output')
-            envoys.set_index(['system_id','serial_number'],inplace=True)
+                if len(envoys) < 1:
+                    envoys = super(CachingEnphaseInterface,self)._execQuery(
+                        system_id,'envoys',kwargs)
 
-            if len(envoys) < 1:
-                envoys = super(CachingEnphaseInterface,self)._execQuery(
-                    system_id,'envoys',kwargs)
-                e = envoys.copy(deep=True)
+                envoys.to_sql('envoys',con.connection, if_exists='append')
 
-                e.reset_index(inplace=True)
-                self.convertTimestamps(e,'sql')
-
-                with self.engine.connect() as con:
-                    e.to_sql('envoys',con.connection, if_exists='append')
         return envoys
-
-    def energy_lifetime(self, system_id, no_cache=False, **kwargs):
-        q = 'select * from energy_lifetime where system_id = ?'
-        con = self.engine.connect()
-        if no_cache is True:
-            el = super(CachingEnphaseInterface,self)._execQuery(
-                system_id,'energy_lifetime',kwargs)
-        else:
-            raise NotImplemented()
-            el = pd.read_sql(q, con.connection, params = (system_id,))
-
-            for col in ('start_date',):
-                el[col] = el[col].apply(lambda x:pd.Timestamp(x))
-            el.set_index(['system_id','start_date'],inplace=True)
-
-            for col in ('start_date',):
-                el[col] = el[col].apply(lambda x:x.isoformat())
-            el.to_sql('energy_lifetime', con.connection, if_exists='replace')
-
-        con.close()
-        return el
 
